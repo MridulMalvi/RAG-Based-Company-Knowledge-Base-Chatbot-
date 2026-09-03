@@ -50,31 +50,140 @@ TOP_K_RESULTS = 5         # number of chunks to retrieve per query
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # LLM configuration (OpenRouter)
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+def get_openrouter_api_key() -> str:
+    """Retrieve OpenRouter API key from Streamlit secrets or environment variables."""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "OPENROUTER_API_KEY" in st.secrets:
+            return str(st.secrets["OPENROUTER_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.getenv("OPENROUTER_API_KEY", "").strip()
+
+
+def get_openrouter_model() -> str:
+    """Retrieve OpenRouter Model from Streamlit secrets or environment variables."""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "OPENROUTER_MODEL" in st.secrets:
+            return str(st.secrets["OPENROUTER_MODEL"]).strip()
+    except Exception:
+        pass
+    return os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free").strip()
+
+
+OPENROUTER_API_KEY = get_openrouter_api_key()
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Read model from .env (OPENROUTER_MODEL), fall back to an active free model
-LLM_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
+LLM_MODEL = get_openrouter_model()
 
 # Fallback sentinel response
 NO_INFO_RESPONSE = "Information not available in knowledge base."
 
 # System prompt enforcing strict grounding
-SYSTEM_PROMPT = """You are a helpful assistant for Nexora Technologies, an IT company.
-Your ONLY knowledge source is the context retrieved from the company knowledge base provided below.
+SYSTEM_PROMPT = """You are the official AI knowledge assistant for Nexora Technologies Pvt. Ltd.
+Your answers must be accurate and grounded in the context provided below (which includes Nexora company knowledge base documents and any user-uploaded files).
 
-STRICT RULES — YOU MUST FOLLOW THESE WITHOUT EXCEPTION:
-1. Answer ONLY using the information present in the provided context.
-2. Do NOT use any external knowledge, training data, or assumptions.
-3. If the context does not contain enough information to answer the question, respond with EXACTLY this phrase and nothing else:
+Guidelines:
+1. Always interpret queries about "the company", "this company", "we", "our", "organization", "policies", or "products" as referring to Nexora Technologies (or any uploaded documents in context).
+2. Answer clearly, accurately, and professionally based on the provided context.
+3. If the context really does not contain the information needed to answer, reply with:
    "Information not available in knowledge base."
-4. Do NOT guess, speculate, or provide partial answers from external knowledge.
-5. Every factual statement must be directly traceable to the provided context.
-6. Keep your answer clear, concise, and professional.
+4. Deliver your direct, well-formatted answer immediately. Do not include any internal thought processes, planning commentary, or meta-notes.
 
-Context from Knowledge Base:
-{context}
+Context:
+{context}"""
 
-Remember: If the answer is not in the context above, say exactly "Information not available in knowledge base." """
+
+def clean_llm_response(text: str) -> str:
+    """
+    Strips internal thinking/reasoning tags, echoed context sections,
+    and scratchpad/verification notes so only the clean final answer is displayed.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    cleaned = text
+
+    # 1. Strip XML-like thinking/thought/reasoning tags
+    cleaned = re.sub(r"<(think|thought|reasoning)>.*?</\1>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<(think|thought|reasoning)>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2. Strip BBCode-style tags: [THINK]...[/THINK]
+    cleaned = re.sub(r"\[(THINK|THOUGHT|REASONING)\].*?\[/\1\]", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    # 3. Detect known Nemotron / reasoning scratchpad markers
+    scratchpad_terms = [
+        "check constraints",
+        "i'll draft",
+        "i will draft",
+        "verify against context",
+        "verification against context",
+        "chunking",
+        "thinking process",
+        "thought process",
+        "reasoning steps",
+        "scratchpad",
+    ]
+    has_scratchpad = any(marker in cleaned.lower() for marker in scratchpad_terms)
+
+    if has_scratchpad:
+        # Check if there is an explicit answer header
+        splits = re.split(
+            r"(?i)\n+(?:#{1,4}\s*|\*{1,2})?(?:Final Answer|Final Response|Answer|Response|Direct Answer)(?:\*{1,2})?:?\s*\n*",
+            cleaned,
+        )
+        if len(splits) > 1 and splits[-1].strip():
+            cleaned = splits[-1]
+        else:
+            # Strip scratchpad sections sequentially
+            # 1. Remove "Chunking..." block
+            cleaned = re.sub(r"(?is)(?:#{1,4}\s*|\*{1,2})?chunking.*?(?=\n\n|\Z)", "", cleaned)
+            # 2. Remove "Check constraints..." block
+            cleaned = re.sub(r"(?is)(?:#{1,4}\s*|\*{1,2})?check constraints.*?(?=\n\n(?:#{1,4}\s*|\*{1,2})?(?:i['’]ll draft|draft|verify|answer)|\Z)", "", cleaned)
+            # 3. Remove "Verify against context..." block
+            cleaned = re.sub(r"(?is)(?:#{1,4}\s*|\*{1,2})?verify against context.*?(?=\n\n|\Z)", "", cleaned)
+            # 4. Remove leading "I'll draft..." header
+            cleaned = re.sub(r"(?is)^.*?(?:i['’]ll draft|i will draft|drafting response):?\s*", "", cleaned)
+
+    # 4. Remove leading lines echoing "Context:" or "Retrieved Context:"
+    cleaned = re.sub(r"(?i)^(?:retrieved\s+)?context(?:\s+received)?:\s*.*?(?=\n\n|\r\n\r\n|$)", "", cleaned, flags=re.DOTALL)
+
+    # 5. Clean up any leftover leading headers
+    cleaned = cleaned.strip()
+    cleaned = re.sub(
+        r"^(?:#{1,4}\s*|\*{1,2})?(?:Final Answer|Final Response|Answer|Draft|Response)(?:\*{1,2})?:?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    res = cleaned.strip()
+
+    # 6. Deduplicate repetitive degenerate loops (where the model repeats identical paragraphs or lists)
+    blocks = re.split(r"\n{2,}", res)
+    if len(blocks) > 1:
+        unique_blocks = []
+        seen_signatures = []
+        for b in blocks:
+            words = set(re.findall(r"[a-zA-Z0-9]{3,}", b.lower()))
+            if len(words) >= 4:
+                is_dup = False
+                for prev_words in seen_signatures:
+                    intersection = words & prev_words
+                    union = words | prev_words
+                    similarity = len(intersection) / len(union) if union else 0
+                    if similarity > 0.60:
+                        is_dup = True
+                        break
+                if is_dup:
+                    break
+                seen_signatures.append(words)
+            unique_blocks.append(b)
+
+        res = "\n\n".join(unique_blocks).strip()
+        res = re.sub(r"(?i)\n+\s*(?:#{1,4}\s*|\*{1,2})?[a-zA-Z\s]{2,35}:(?:\*{1,2})?\s*$", "", res).strip()
+
+    return res if res else text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -83,27 +192,48 @@ Remember: If the answer is not in the context above, say exactly "Information no
 
 def load_documents(data_dir: Path = DATA_DIR) -> list[Document]:
     """
-    Load all Markdown (.md) files from the data directory.
+    Load all supported files (.md, .pdf, .docx, .txt) from the data directory.
     Returns a list of LangChain Document objects with source metadata.
     """
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory '{data_dir}' not found.")
 
-    md_files = list(data_dir.glob("*.md"))
-    if not md_files:
-        raise ValueError(f"No .md files found in '{data_dir}'.")
+    supported_extensions = {".md", ".pdf", ".docx", ".txt"}
+    all_files = [
+        f for f in data_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in supported_extensions
+    ]
+    if not all_files:
+        raise ValueError(f"No supported documents found in '{data_dir}'.")
 
     documents = []
-    for file_path in md_files:
+    for file_path in all_files:
         try:
-            loader = TextLoader(str(file_path), encoding="utf-8")
-            docs = loader.load()
-            # Enrich metadata with a clean, readable source name
+            ext = file_path.suffix.lower()
+            if ext == ".pdf":
+                loader = PyPDFLoader(str(file_path))
+                docs = loader.load()
+            elif ext == ".docx":
+                loader = Docx2txtLoader(str(file_path))
+                docs = loader.load()
+            elif ext in (".txt", ".md"):
+                try:
+                    loader = TextLoader(str(file_path), encoding="utf-8")
+                    docs = loader.load()
+                except Exception:
+                    loader = TextLoader(str(file_path), encoding="latin-1")
+                    docs = loader.load()
+            else:
+                continue
+
             for doc in docs:
                 doc.metadata["source"] = file_path.name
                 doc.metadata["source_path"] = str(file_path)
-                # Extract a friendly document title from the first H1 heading
-                doc.metadata["doc_title"] = _extract_title(doc.page_content, file_path.stem)
+                doc.metadata["doc_title"] = (
+                    _extract_title(doc.page_content, file_path.stem)
+                    if ext == ".md"
+                    else file_path.stem.replace("_", " ").title()
+                )
             documents.extend(docs)
             logger.info(f"Loaded: {file_path.name} ({len(docs)} document(s))")
         except Exception as e:
@@ -206,43 +336,75 @@ def load_vectorstore(embeddings: HuggingFaceEmbeddings) -> Optional[FAISS]:
 def load_uploaded_file(uploaded_file) -> list[Document]:
     """
     Parse an in-memory Streamlit UploadedFile object into LangChain Documents.
-
     Supported extensions: .pdf, .txt, .md, .docx
-    The file bytes are written to a temp file so the loaders (which expect a
-    file path) can read them; the temp file is deleted immediately after.
     """
     import tempfile
 
     file_name = uploaded_file.name
     ext = Path(file_name).suffix.lower()
+
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
     file_bytes = uploaded_file.read()
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+
+    if not file_bytes:
+        logger.warning(f"Uploaded file '{file_name}' is empty.")
+        return []
 
     # Write to a named temp file so path-based loaders can open it
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
+    docs = []
     try:
         if ext == ".pdf":
-            loader = PyPDFLoader(tmp_path)
+            try:
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+            except Exception as pdf_err:
+                logger.warning(f"PyPDFLoader failed ({pdf_err}), falling back to pypdf.PdfReader...")
+                import pypdf
+                reader = pypdf.PdfReader(tmp_path)
+                for i, page in enumerate(reader.pages):
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        docs.append(Document(page_content=text, metadata={"page": i}))
         elif ext == ".docx":
-            loader = Docx2txtLoader(tmp_path)
+            try:
+                loader = Docx2txtLoader(tmp_path)
+                docs = loader.load()
+            except Exception as docx_err:
+                logger.warning(f"Docx2txtLoader failed ({docx_err}), falling back to docx2txt...")
+                import docx2txt
+                text = docx2txt.process(tmp_path) or ""
+                if text.strip():
+                    docs.append(Document(page_content=text))
         elif ext in (".txt", ".md"):
-            loader = TextLoader(tmp_path, encoding="utf-8")
+            try:
+                loader = TextLoader(tmp_path, encoding="utf-8")
+                docs = loader.load()
+            except Exception:
+                loader = TextLoader(tmp_path, encoding="latin-1")
+                docs = loader.load()
         else:
             raise ValueError(f"Unsupported file type: {ext}")
-
-        docs = loader.load()
     finally:
         Path(tmp_path).unlink(missing_ok=True)   # always clean up temp file
+
+    # Filter out empty pages
+    docs = [d for d in docs if d.page_content and d.page_content.strip()]
 
     # Normalise metadata: attach the original filename and a human title
     for doc in docs:
         doc.metadata["source"] = file_name
         doc.metadata["source_path"] = file_name
-        doc.metadata["doc_title"] = _extract_title(
-            doc.page_content,
-            Path(file_name).stem,
+        doc.metadata["doc_title"] = (
+            _extract_title(doc.page_content, Path(file_name).stem)
+            if ext == ".md"
+            else Path(file_name).stem.replace("_", " ").title()
         )
 
     logger.info(f"Loaded uploaded file '{file_name}': {len(docs)} page(s)/doc(s)")
@@ -317,16 +479,20 @@ def get_llm() -> ChatOpenAI:
     """
     Instantiate the ChatOpenAI client pointing to the OpenRouter API endpoint.
     """
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your_openrouter_api_key_here":
+    api_key = get_openrouter_api_key()
+    if not api_key or api_key == "your_openrouter_api_key_here":
         raise ValueError(
-            "OPENROUTER_API_KEY is not set. Please add it to your .env file."
+            "OPENROUTER_API_KEY is not set. Please add it to your Streamlit Secrets or .env file."
         )
 
+    model_name = get_openrouter_model()
     llm = ChatOpenAI(
-        model=LLM_MODEL,
-        api_key=OPENROUTER_API_KEY,
+        model=model_name,
+        api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
-        temperature=0.1,          # low temperature for factual consistency
+        temperature=0.2,          # 0.2 prevents deterministic greedy repetition loops
+        frequency_penalty=0.5,    # prevents repeating same paragraphs or lists
+        presence_penalty=0.3,
         max_tokens=1024,
         default_headers={
             "HTTP-Referer": "https://nexora.tech",
@@ -375,7 +541,10 @@ def answer_question(
     # Step 4: Call LLM
     try:
         response = llm.invoke(messages)
-        answer = response.content.strip()
+        raw_answer = response.content.strip() if hasattr(response, "content") else str(response).strip()
+        answer = clean_llm_response(raw_answer)
+        if not answer:
+            answer = raw_answer
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         answer = f"Error communicating with the LLM: {e}"

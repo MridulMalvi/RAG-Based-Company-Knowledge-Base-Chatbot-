@@ -245,8 +245,15 @@ To add new documents:
 
 ---
 
+## 🚀 Streamlit Community Cloud Deployment (100% Free)
+
+This repository is ready for 1-click deployment on **Streamlit Community Cloud**:
+- **App URL:** Deploy via [share.streamlit.io](https://share.streamlit.io)
+- **Secrets Setup:** Set `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` in App Settings → Secrets.
+- **Detailed Instructions:** See [DEPLOYMENT.md](DEPLOYMENT.md) for full instructions.
+
+---
+
 ## 📜 License
 
-This project is provided for educational and demonstration purposes. The company "NovaTech Solutions" and all associated content are entirely fictional.
-#   R A G - B a s e d - C o m p a n y - K n o w l e d g e - B a s e - C h a t b o t -  
- 
+This project is provided for educational and demonstration purposes. The company "Nexora Technologies" and all associated content are entirely fictional.

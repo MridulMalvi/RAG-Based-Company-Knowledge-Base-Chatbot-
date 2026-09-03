@@ -8,10 +8,105 @@ uploading documents (PDF, TXT, DOCX, MD), and inspecting citations with zero hal
 import streamlit as st
 import time
 import traceback
+import importlib
+import re
 from pathlib import Path
 
-# Import RAG pipeline components
+# Import RAG pipeline components and force reload to keep in sync
 import rag_pipeline as rag
+try:
+    importlib.reload(rag)
+except Exception:
+    pass
+
+
+def clean_llm_response(text: str) -> str:
+    """Safely strip reasoning tags, scratchpad notes, and thinking steps from the LLM output."""
+    if hasattr(rag, "clean_llm_response"):
+        try:
+            return rag.clean_llm_response(text)
+        except Exception:
+            pass
+
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    cleaned = text
+
+    # 1. Strip XML-like thinking/thought/reasoning tags
+    cleaned = re.sub(r"<(think|thought|reasoning)>.*?</\1>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<(think|thought|reasoning)>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2. Strip BBCode-style tags: [THINK]...[/THINK]
+    cleaned = re.sub(r"\[(THINK|THOUGHT|REASONING)\].*?\[/\1\]", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    # 3. Detect known Nemotron / reasoning scratchpad markers
+    scratchpad_terms = [
+        "check constraints",
+        "i'll draft",
+        "i will draft",
+        "verify against context",
+        "verification against context",
+        "chunking",
+        "thinking process",
+        "thought process",
+        "reasoning steps",
+        "scratchpad",
+    ]
+    has_scratchpad = any(marker in cleaned.lower() for marker in scratchpad_terms)
+
+    if has_scratchpad:
+        splits = re.split(
+            r"(?i)\n+(?:#{1,4}\s*|\*{1,2})?(?:Final Answer|Final Response|Answer|Response|Direct Answer)(?:\*{1,2})?:?\s*\n*",
+            cleaned,
+        )
+        if len(splits) > 1 and splits[-1].strip():
+            cleaned = splits[-1]
+        else:
+            cleaned = re.sub(r"(?is)(?:#{1,4}\s*|\*{1,2})?chunking.*?(?=\n\n|\Z)", "", cleaned)
+            cleaned = re.sub(r"(?is)(?:#{1,4}\s*|\*{1,2})?check constraints.*?(?=\n\n(?:#{1,4}\s*|\*{1,2})?(?:i['’]ll draft|draft|verify|answer)|\Z)", "", cleaned)
+            cleaned = re.sub(r"(?is)(?:#{1,4}\s*|\*{1,2})?verify against context.*?(?=\n\n|\Z)", "", cleaned)
+            cleaned = re.sub(r"(?is)^.*?(?:i['’]ll draft|i will draft|drafting response):?\s*", "", cleaned)
+
+    # 4. Remove leading lines echoing "Context:" or "Retrieved Context:"
+    cleaned = re.sub(r"(?i)^(?:retrieved\s+)?context(?:\s+received)?:\s*.*?(?=\n\n|\r\n\r\n|$)", "", cleaned, flags=re.DOTALL)
+
+    # 5. Clean up any leftover leading headers
+    cleaned = cleaned.strip()
+    cleaned = re.sub(
+        r"^(?:#{1,4}\s*|\*{1,2})?(?:Final Answer|Final Response|Answer|Draft|Response)(?:\*{1,2})?:?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    res = cleaned.strip()
+
+    # 6. Deduplicate repetitive degenerate loops (where the model repeats identical paragraphs or lists)
+    blocks = re.split(r"\n{2,}", res)
+    if len(blocks) > 1:
+        unique_blocks = []
+        seen_signatures = []
+        for b in blocks:
+            words = set(re.findall(r"[a-zA-Z0-9]{3,}", b.lower()))
+            if len(words) >= 4:
+                is_dup = False
+                for prev_words in seen_signatures:
+                    intersection = words & prev_words
+                    union = words | prev_words
+                    similarity = len(intersection) / len(union) if union else 0
+                    if similarity > 0.60:
+                        is_dup = True
+                        break
+                if is_dup:
+                    break
+                seen_signatures.append(words)
+            unique_blocks.append(b)
+
+        res = "\n\n".join(unique_blocks).strip()
+        res = re.sub(r"(?i)\n+\s*(?:#{1,4}\s*|\*{1,2})?[a-zA-Z\s]{2,35}:(?:\*{1,2})?\s*$", "", res).strip()
+
+    return res if res else text.strip()
 
 # ---------------------------------------------------------------------------
 # Page Configuration
@@ -507,6 +602,8 @@ if "kb_error" not in st.session_state:
     st.session_state.kb_error = ""
 if "doc_stats" not in st.session_state:
     st.session_state.doc_stats = {}
+if "processed_file_signatures" not in st.session_state:
+    st.session_state.processed_file_signatures = set()
 if "upload_success_msg" not in st.session_state:
     st.session_state.upload_success_msg = ""
 if "uploaded_file_names" not in st.session_state:
@@ -536,8 +633,14 @@ def _init_pipeline():
 
 
 def is_no_info_response(answer: str) -> bool:
-    """Check if the answer matches the fallback sentinel."""
-    return rag.NO_INFO_RESPONSE.lower() in answer.lower()
+    """Check if the answer strictly matches the fallback sentinel."""
+    cleaned = answer.strip().lower()
+    sentinel = rag.NO_INFO_RESPONSE.strip().lower()
+    return (
+        cleaned == sentinel
+        or cleaned == sentinel.rstrip(".")
+        or (cleaned.startswith(sentinel) and len(cleaned) < len(sentinel) + 20)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -597,34 +700,61 @@ with st.sidebar:
         type=["pdf", "txt", "docx", "md"],
         accept_multiple_files=True,
         key="file_uploader",
-        disabled=not kb_ready,
         help="Files will be parsed, chunked, and embedded into the active FAISS index.",
     )
 
-    if st.button(
-        "Index Uploaded Documents",
-        key="btn_process_uploads",
-        use_container_width=True,
-        disabled=(not kb_ready or not uploaded_files),
-    ):
+    # Detect files that have not yet been indexed in this session
+    pending_files = []
+    if uploaded_files:
+        for uf in uploaded_files:
+            sig = f"{uf.name}_{uf.size}"
+            if sig not in st.session_state.processed_file_signatures:
+                pending_files.append(uf)
+
+    # Manual or automatic trigger for indexing
+    trigger_indexing = False
+    if pending_files:
+        st.info(f"📁 {len(pending_files)} new file(s) ready to index.")
+        if st.button("⚡ Index Uploaded Documents", key="btn_process_uploads", type="primary", use_container_width=True):
+            trigger_indexing = True
+        else:
+            # Auto-index immediately so the user can query right away
+            trigger_indexing = True
+
+    if trigger_indexing and pending_files:
         total_chunks = 0
         processed_names = []
         errors = []
 
-        with st.status("Indexing uploaded files...", expanded=True) as upload_status:
+        with st.status(f"Indexing {len(pending_files)} file(s)...", expanded=True) as upload_status:
             try:
                 embeddings = rag.get_embeddings()
+                if st.session_state.vectorstore is None:
+                    _, st.session_state.vectorstore, st.session_state.llm = _init_pipeline()
+                    st.session_state.kb_status = "ready"
             except Exception as e:
-                upload_status.update(label=f"Embedding error: {e}", state="error")
+                upload_status.update(label=f"Initialization error: {e}", state="error")
                 st.stop()
 
-            for uf in uploaded_files:
-                st.write(f"Processing `{uf.name}`...")
+            for uf in pending_files:
+                st.write(f"📄 Parsing `{uf.name}`...")
                 try:
+                    # 1. Save uploaded file to data directory so it persists permanently
+                    save_dest = rag.DATA_DIR / uf.name
+                    if hasattr(uf, "seek"):
+                        uf.seek(0)
+                    with open(save_dest, "wb") as f:
+                        f.write(uf.read())
+                    if hasattr(uf, "seek"):
+                        uf.seek(0)
+
+                    # 2. Extract LangChain documents from uploaded file
                     docs = rag.load_uploaded_file(uf)
                     if not docs:
-                        st.write(f"⚠️ No text found in `{uf.name}` — skipped.")
+                        st.write(f"⚠️ No readable text found in `{uf.name}` — skipped.")
                         continue
+
+                    # 3. Add to live FAISS vector store and persist
                     vs, n_chunks = rag.add_documents_to_vectorstore(
                         docs,
                         st.session_state.vectorstore,
@@ -633,24 +763,33 @@ with st.sidebar:
                     st.session_state.vectorstore = vs
                     total_chunks += n_chunks
                     processed_names.append(uf.name)
+                    st.session_state.processed_file_signatures.add(f"{uf.name}_{uf.size}")
                     st.write(f"✅ Added {n_chunks} chunk(s) from `{uf.name}`")
                 except Exception as e:
                     errors.append(f"{uf.name}: {e}")
                     st.write(f"❌ Failed `{uf.name}`: {e}")
 
-        if processed_names:
-            existing = st.session_state.doc_stats.get("files", [])
-            new_files = [n for n in processed_names if n not in existing]
-            st.session_state.doc_stats["files"] = existing + new_files
-            st.session_state.doc_stats["file_count"] = len(st.session_state.doc_stats["files"])
-            success_str = f"Successfully indexed {total_chunks} chunk(s) from {len(processed_names)} file(s)."
-            upload_status.update(label=success_str, state="complete", expanded=False)
-            st.session_state.upload_success_msg = success_str
-            st.session_state.uploaded_file_names = processed_names
-        else:
-            upload_status.update(label="No files were successfully processed.", state="error", expanded=True)
+            # Clear cached pipeline so subsequent reloads pick up new index
+            _init_pipeline.clear()
 
-        st.rerun()
+            if processed_names:
+                supported_exts = {".md", ".pdf", ".docx", ".txt"}
+                all_files = [
+                    f.name for f in rag.DATA_DIR.iterdir()
+                    if f.is_file() and f.suffix.lower() in supported_exts
+                ]
+                st.session_state.doc_stats = {
+                    "file_count": len(all_files),
+                    "files": all_files,
+                }
+                success_str = f"Successfully indexed {total_chunks} chunk(s) from {len(processed_names)} file(s)."
+                upload_status.update(label=success_str, state="complete", expanded=False)
+                st.session_state.upload_success_msg = success_str
+                st.session_state.uploaded_file_names = processed_names
+                st.rerun()
+            else:
+                err_msg = "No files were successfully processed." + (f" ({'; '.join(errors)})" if errors else "")
+                upload_status.update(label=err_msg, state="error", expanded=True)
 
     if st.session_state.upload_success_msg:
         st.success(st.session_state.upload_success_msg)
@@ -671,6 +810,7 @@ with st.sidebar:
             st.session_state.llm = None
             st.session_state.kb_status = "not_loaded"
             st.session_state.doc_stats = {}
+            st.session_state.processed_file_signatures = set()
             st.session_state.chat_history = []
             st.rerun()
     with c_btn2:
@@ -738,16 +878,33 @@ if st.session_state.kb_status != "ready":
         st.session_state.llm = _llm
         st.session_state.kb_status = "ready"
         st.session_state.kb_error = ""
-        md_files = list(rag.DATA_DIR.glob("*.md"))
+        supported_exts = {".md", ".pdf", ".docx", ".txt"}
+        all_docs = [
+            f.name for f in rag.DATA_DIR.iterdir()
+            if f.is_file() and f.suffix.lower() in supported_exts
+        ]
         st.session_state.doc_stats = {
-            "file_count": len(md_files),
-            "files": [f.name for f in md_files],
+            "file_count": len(all_docs),
+            "files": all_docs,
         }
         st.rerun()
     except Exception as e:
         st.session_state.kb_status = "error"
         st.session_state.kb_error = str(e)
-        st.error(f"Failed to initialize knowledge base: {e}")
+        if "OPENROUTER_API_KEY" in str(e):
+            st.warning(
+                "🔑 **OpenRouter API Key Required**\n\n"
+                "To activate this chatbot on Streamlit Community Cloud:\n\n"
+                "1. Go to your **Streamlit Cloud Dashboard** → Click **⚙️ Settings** → **Secrets**.\n"
+                "2. Paste your OpenRouter API key (get a free key at [openrouter.ai](https://openrouter.ai)):\n"
+                "```toml\n"
+                "OPENROUTER_API_KEY = \"sk-or-v1-...\"\n"
+                "OPENROUTER_MODEL = \"nvidia/nemotron-3.5-lightning:free\"\n"
+                "```\n"
+                "3. Click **Save** and the app will start instantly!"
+            )
+        else:
+            st.error(f"Failed to initialize knowledge base: {e}")
         st.stop()
 
 
@@ -769,7 +926,7 @@ def render_turn(turn: dict):
     )
 
     # 2. Assistant Response
-    answer = turn["answer"]
+    answer = clean_llm_response(turn.get("answer", ""))
     if is_no_info_response(answer):
         st.markdown(
             f'<div class="alert-no-info">⚠️ <span>{rag.NO_INFO_RESPONSE}</span></div>',
@@ -781,31 +938,64 @@ def render_turn(turn: dict):
             unsafe_allow_html=True,
         )
 
-    # 3. Citation Cards in 2-Column Layout
-    sources = turn.get("sources", [])
-    if sources and not is_no_info_response(answer):
-        with st.expander(f"📎 Verified Sources ({len(sources)} references)", expanded=False):
-            cols = st.columns(min(len(sources), 2))
-            for idx, src in enumerate(sources):
-                with cols[idx % 2]:
-                    st.markdown(
-                        f"""
-                        <div class="source-card">
-                            <div class="source-header">
-                                <span class="source-tag">📄 {src["file"]}</span>
-                                <span class="chunk-tag">Chunk #{src["chunk"]}</span>
-                            </div>
-                            <div class="source-title">{src["title"]}</div>
-                            <div class="source-preview">"{src["preview"]}"</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+    # (Sources and debug context intentionally hidden from end users)
 
-    # 4. Raw Retrieved Context in Collapsible Expander
-    if turn.get("context_text"):
-        with st.expander("🔍 Raw Retrieved Context (Debug)", expanded=False):
-            st.code(turn["context_text"], language="markdown")
+
+# ---------------------------------------------------------------------------
+# Conversational Intent Handler (greetings, small-talk, meta questions)
+# ---------------------------------------------------------------------------
+import random
+
+_GREETINGS = {"hi", "hello", "hey", "hiya", "howdy", "sup", "yo", "greetings", "good morning", "good afternoon", "good evening"}
+_WELLBEING = {"how are you", "how are you doing", "how's it going", "how do you do", "what's up", "whats up", "how r u"}
+_WHO_AM_I = {"who are you", "what are you", "what can you do", "what do you do", "tell me about yourself", "your name", "who made you"}
+_THANKS = {"thanks", "thank you", "thank you so much", "thx", "ty", "cheers", "great", "awesome", "cool", "nice"}
+_BYE = {"bye", "goodbye", "see you", "see ya", "cya", "take care", "later"}
+_HELP = {"help", "what should i ask", "what can i ask", "examples", "give me an example", "show examples"}
+
+_GREETING_REPLIES = [
+    "Hello! 👋 I'm the Nexora Technologies Knowledge Assistant. Ask me anything about our products, services, pricing, or HR policies!",
+    "Hi there! 😊 Welcome to Nexora's knowledge base. What would you like to know today?",
+    "Hey! Great to see you. I'm here to answer any questions about Nexora Technologies. How can I help?",
+]
+_WELLBEING_REPLIES = [
+    "I'm doing great and ready to help! 😊 Ask me anything about Nexora Technologies.",
+    "All systems running smoothly! What can I help you with today?",
+    "Feeling helpful as ever! Go ahead — what would you like to know about Nexora?",
+]
+_WHO_REPLIES = [
+    "I'm the **Nexora Technologies Knowledge Assistant** 🤖 — an AI chatbot powered by a RAG (Retrieval-Augmented Generation) pipeline. I have deep knowledge of Nexora's products, services, pricing, and HR policies. Just ask!",
+]
+_THANKS_REPLIES = [
+    "You're welcome! 😊 Let me know if there's anything else I can help with.",
+    "Happy to help! Feel free to ask more questions anytime.",
+    "Glad I could assist! Is there anything else you'd like to know about Nexora?",
+]
+_BYE_REPLIES = [
+    "Goodbye! 👋 Have a great day. Come back anytime you have questions about Nexora Technologies.",
+    "Take care! 😊 Feel free to return whenever you need information.",
+]
+_HELP_REPLIES = [
+    "Here are some things you can ask me:\n\n- 🏢 *What products does Nexora offer?*\n- 💰 *What is the pricing for CloudSync Pro?*\n- 👥 *What is the leave policy at Nexora?*\n- 🛠️ *What IT support services are available?*\n- ❓ *What are Nexora's working hours?*",
+]
+
+
+def get_conversational_reply(text: str) -> str | None:
+    """Returns a friendly reply for casual inputs, or None if it's a KB query."""
+    cleaned = text.strip().lower().rstrip("!?.")
+    if cleaned in _GREETINGS or any(cleaned.startswith(g) for g in _GREETINGS):
+        return random.choice(_GREETING_REPLIES)
+    if cleaned in _WELLBEING:
+        return random.choice(_WELLBEING_REPLIES)
+    if any(kw in cleaned for kw in _WHO_AM_I):
+        return random.choice(_WHO_REPLIES)
+    if cleaned in _THANKS or any(cleaned.startswith(t) for t in _THANKS):
+        return random.choice(_THANKS_REPLIES)
+    if cleaned in _BYE:
+        return random.choice(_BYE_REPLIES)
+    if cleaned in _HELP or any(kw in cleaned for kw in _HELP):
+        return random.choice(_HELP_REPLIES)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -839,11 +1029,24 @@ with chat_container:
             unsafe_allow_html=True,
         )
 
-        # 2. Progress spinner directly under question
-        if st.session_state.vectorstore is None or st.session_state.llm is None:
+        # 2. Check for conversational / small-talk inputs first
+        casual_reply = get_conversational_reply(query_to_run)
+        if casual_reply:
+            st.session_state.chat_history.append(
+                {
+                    "question": query_to_run,
+                    "answer": casual_reply,
+                    "sources": [],
+                    "context_text": "",
+                }
+            )
+            st.rerun()
+
+        # 3. RAG pipeline for knowledge base questions
+        elif st.session_state.vectorstore is None or st.session_state.llm is None:
             st.error("Knowledge base is offline. Please click Rebuild Index in the sidebar.")
         else:
-            with st.spinner("Searching internal documents and formulating grounded answer..."):
+            with st.spinner("Thinking..."):
                 try:
                     result = rag.answer_question(
                         query=query_to_run,

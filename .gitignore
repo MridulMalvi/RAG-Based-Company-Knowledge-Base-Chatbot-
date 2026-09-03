@@ -1,9 +1,14 @@
-# Environment variables
+# ==============================================================================
+# Environment & Secrets (NEVER COMMIT)
+# ==============================================================================
 .env
 .env.local
 .env.*.local
+.streamlit/secrets.toml
 
-# Python cache & artifacts
+# ==============================================================================
+# Python & Bytecode
+# ==============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -25,7 +30,9 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# ==============================================================================
+# Virtual Environments
+# ==============================================================================
 venv/
 env/
 myenv/
@@ -33,18 +40,42 @@ ENV/
 env.bak/
 venv.bak/
 .venv/
+conda-env/
 
-# Vector database persisted local index
+# ==============================================================================
+# Vector Store & Cache (Auto-generated on launch)
+# ==============================================================================
 faiss_index/
+.cache/
+.streamlit/cache/
 
-# Evaluation reports & temporary files
+# ==============================================================================
+# Testing, Scratch & Evaluation Logs
+# ==============================================================================
 evaluation_report.json
 evaluation_report.txt
+test_results.json
+test_report.txt
+test_output.txt
+scratch_*.txt
+scratch/
+test_cleaner.py
+test_prompt_run.py
 *.log
 temp/
 tmp/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# IDE / Editor
+# ==============================================================================
+# Temporary User Uploads & Test Documents
+# ==============================================================================
+data/AI_Machine Learning Approach for Predicting the Habitability Potential of Exoplanets.pdf
+
+# ==============================================================================
+# Operating System & IDE Files
+# ==============================================================================
 .vscode/
 .idea/
 *.swp
@@ -52,6 +83,11 @@ tmp/
 *~
 .DS_Store
 Thumbs.db
+Desktop.ini
+ehthumbs.db
 
-# Streamlit config
-.streamlit/secrets.toml
+# ==============================================================================
+# AI / Agent Metadata
+# ==============================================================================
+.agents/
+.gemini/
