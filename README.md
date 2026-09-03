@@ -243,14 +243,6 @@ To add new documents:
 2. Click **"🔄 Rebuild"** in the sidebar (or run `python rag_pipeline.py` from the CLI).
 3. The FAISS index will be rebuilt to include the new content.
 
----
-
-## 🚀 Streamlit Community Cloud Deployment (100% Free)
-
-This repository is ready for 1-click deployment on **Streamlit Community Cloud**:
-- **App URL:** Deploy via [share.streamlit.io](https://share.streamlit.io)
-- **Secrets Setup:** Set `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` in App Settings → Secrets.
-- **Detailed Instructions:** See [DEPLOYMENT.md](DEPLOYMENT.md) for full instructions.
 
 ---
 
