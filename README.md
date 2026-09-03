@@ -35,7 +35,7 @@ A production-quality, **Retrieval-Augmented Generation (RAG)** chatbot that lets
 │                    RAG Pipeline (rag_pipeline.py)             │
 │                                                               │
 │  1. QUERY EMBEDDING                                           │
-│     sentence-transformers/all-MiniLM-L6-v2                   │
+│     sentence-transformers/all-MiniLM-L6-v2                    │
 │     question → 384-dim dense vector                           │
 │                                                               │
 │  2. SIMILARITY SEARCH                                         │
@@ -48,7 +48,7 @@ A production-quality, **Retrieval-Augmented Generation (RAG)** chatbot that lets
 │  4. LLM GENERATION (OpenRouter)                               │
 │     SystemPrompt [strict grounding rules + context]           │
 │     + HumanMessage [user question]                            │
-│     → meta-llama/llama-3.3-70b-instruct:free                 │
+│     → meta-llama/llama-3.3-70b-instruct:free                  │
 │     → Grounded answer (or "Information not available...")     │
 │                                                               │
 │  5. CITATION EXTRACTION                                       │
@@ -58,10 +58,10 @@ A production-quality, **Retrieval-Augmented Generation (RAG)** chatbot that lets
                         ▼
 ┌───────────────────────────────────────────────────────────────┐
 │                    Knowledge Base (data/)                     │
-│   company_profile.md  │  products.md  │  services.md         │
+│   company_profile.md  │  products.md  │  services.md          │
 │   pricing.md          │  hr_policies.md  │  faqs.md           │
 │                                                               │
-│   Indexed as FAISS vector store (faiss_index/)               │
+│   Indexed as FAISS vector store (faiss_index/)                │
 │   Chunk size: 800 chars | Overlap: 150 chars                  │
 └───────────────────────────────────────────────────────────────┘
 ```
